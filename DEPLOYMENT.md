@@ -22,6 +22,124 @@ DATABASE_URL=postgresql://user:password@host:5432/scoutoff
 This mismatch will be enforced by a startup check in a future release; for now it is a critical configuration trap that every operator must be aware of.
 
 
+## Database Migrations
+
+The backend uses a deterministic migration system (file-based, ordered alphabetically) to evolve the database schema. Migrations are automatically applied on server startup, but operators often need to run them independently — for example, in pre-deployment validation steps or when troubleshooting without starting the full server.
+
+### Available Commands
+
+| Command | Purpose | Exit Code |
+|---------|---------|-----------|
+| `npm run db:migrate` | Apply all pending migrations | 0 on success, 1 on error |
+| `npm run db:migrate:status` | Show which migrations have been applied | 0 if up-to-date, 2 if behind, 1 on error |
+| `npm run db:migrate:version` | Print the current schema version (last applied migration) | 0 on success, 1 on error |
+
+### Running Migrations as a One-Off
+
+In **development or staging**, migrations run automatically when the server starts. To run them in isolation:
+
+```bash
+npm run db:migrate
+```
+
+### Kubernetes / Docker Pre-Deploy Job
+
+To ensure the database is migrated **before** the application pod starts, use an init container or pre-deploy Job:
+
+```yaml
+# init container variant (in the Deployment pod spec)
+initContainers:
+  - name: migrate
+    image: scout-off-backend:latest
+    command:
+      - /bin/sh
+      - -c
+      - |
+        npm install --omit=dev
+        npm run db:migrate
+    env:
+      - name: NODE_ENV
+        value: production
+      # ... database connection vars (DB_DRIVER, DATABASE_URL, etc.)
+```
+
+Or as a separate **pre-deploy Kubernetes Job**:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scout-off-migrate
+spec:
+  template:
+    spec:
+      serviceAccountName: scout-off-backend
+      containers:
+        - name: migrate
+          image: scout-off-backend:latest
+          command: 
+            - /bin/sh
+            - -c
+            - |
+              npm install --omit=dev
+              npm run db:migrate
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: DB_DRIVER
+              value: postgres
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: scout-off-secrets
+                  key: DATABASE_URL
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+      restartPolicy: Never
+```
+
+### ⚠️ Production Images
+
+The **production Docker image** (`Dockerfile.prod` or similar) typically does **not** include:
+- `scripts/` directory
+- `ts-node` or TypeScript compiler
+- dev dependencies (see `npm install --omit=dev` above)
+
+**Option 1: Run migrations from a development image** (shown above; simple but larger download)
+
+**Option 2: Precompile the migration script** into the production build:
+```dockerfile
+# In Dockerfile.prod
+RUN npm run build && \
+    npm run build:scripts  # if defined, or tsc --project tsconfig.scripts.json
+```
+
+Then invoke the compiled version:
+```bash
+node dist/scripts/migrate.js up
+```
+
+### Database Migration Status in CI/CD
+
+Use the exit codes to gate deployments:
+
+```bash
+npm run db:migrate:status
+if [ $? -eq 2 ]; then
+  echo "❌ Database is behind; migrations must be applied first"
+  exit 1
+fi
+# Proceed with deployment if exit code is 0
+```
+
+See also [`db/README.md`](db/README.md) for naming conventions, file pairing (SQLite + PostgreSQL), and how to write new migrations.
+
+
 ## Environment Setup
 
 Copy `.env.example` to `.env` and fill in all required values before starting the server.
